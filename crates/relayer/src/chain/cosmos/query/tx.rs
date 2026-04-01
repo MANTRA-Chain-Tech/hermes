@@ -9,6 +9,130 @@ use tendermint_rpc::endpoint::tx::Response as TxResponse;
 use tendermint_rpc::{Client, HttpClient, Order, Url};
 use tracing::warn;
 
+/// Patches all event arrays in a JSON value to add `"attributes": []` where missing.
+fn patch_missing_attributes(events: &mut serde_json::Value) {
+    if let Some(arr) = events.as_array_mut() {
+        for ev in arr {
+            if ev.get("attributes").is_none() {
+                ev["attributes"] = serde_json::Value::Array(vec![]);
+            }
+        }
+    }
+}
+
+/// Performs a `block_results` JSON-RPC call, tolerating events that are missing
+/// the `attributes` field by injecting an empty array before deserialization.
+async fn lenient_block_results(
+    rpc_address: &Url,
+    height: tendermint::block::Height,
+) -> Result<tendermint_rpc::endpoint::block_results::Response, Error> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": -1,
+        "method": "block_results",
+        "params": { "height": height.to_string() }
+    });
+
+    let http = reqwest::Client::new();
+    let mut value: serde_json::Value = http
+        .post(rpc_address.to_string())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            Error::rpc(
+                rpc_address.clone(),
+                tendermint_rpc::Error::parse(e.to_string()),
+            )
+        })?
+        .json()
+        .await
+        .map_err(|e| {
+            Error::rpc(
+                rpc_address.clone(),
+                tendermint_rpc::Error::parse(e.to_string()),
+            )
+        })?;
+
+    let result = &mut value["result"];
+    patch_missing_attributes(&mut result["begin_block_events"]);
+    patch_missing_attributes(&mut result["end_block_events"]);
+    patch_missing_attributes(&mut result["finalize_block_events"]);
+    if let Some(txs) = result["txs_results"].as_array_mut() {
+        for tx in txs {
+            patch_missing_attributes(&mut tx["events"]);
+        }
+    }
+
+    serde_json::from_value(value["result"].take()).map_err(|e| {
+        Error::rpc(
+            rpc_address.clone(),
+            tendermint_rpc::Error::parse(e.to_string()),
+        )
+    })
+}
+
+/// Performs a `tx_search` JSON-RPC call, tolerating events that are missing
+/// the `attributes` field by injecting an empty array before deserialization.
+/// This works around chains that emit attribute-less events, which would
+/// otherwise cause a hard serde failure for the entire response.
+async fn lenient_tx_search(
+    rpc_address: &Url,
+    query: tendermint_rpc::query::Query,
+    page: u32,
+    per_page: u8,
+    order: Order,
+) -> Result<tendermint_rpc::endpoint::tx_search::Response, Error> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": -1,
+        "method": "tx_search",
+        "params": {
+            "query": query.to_string(),
+            "prove": false,
+            "page": page.to_string(),
+            "per_page": per_page.to_string(),
+            "order_by": if matches!(order, Order::Descending) { "desc" } else { "asc" },
+        }
+    });
+
+    let http = reqwest::Client::new();
+    let mut value: serde_json::Value = http
+        .post(rpc_address.to_string())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            Error::rpc(
+                rpc_address.clone(),
+                tendermint_rpc::Error::parse(e.to_string()),
+            )
+        })?
+        .json()
+        .await
+        .map_err(|e| {
+            Error::rpc(
+                rpc_address.clone(),
+                tendermint_rpc::Error::parse(e.to_string()),
+            )
+        })?;
+
+    // Patch: inject `"attributes": []` into any event that omits the field,
+    // so that serde can deserialize the response without failing.
+    if let Some(txs) = value["result"]["txs"].as_array_mut() {
+        for tx in txs {
+            patch_missing_attributes(&mut tx["tx_result"]["events"]);
+        }
+    }
+
+    serde_json::from_value(value["result"].take()).map_err(|e| {
+        Error::rpc(
+            rpc_address.clone(),
+            tendermint_rpc::Error::parse(e.to_string()),
+        )
+    })
+}
+
 use crate::chain::cosmos::query::{header_query, packet_query, tx_hash_query};
 use crate::chain::cosmos::types::events;
 use crate::chain::requests::{
@@ -129,11 +253,11 @@ pub async fn query_packets_from_txs(
     let mut result: Vec<IbcEventWithHeight> = vec![];
 
     for seq in &request.sequences {
-        // Query the latest 10 txs which include the event specified in the query request
-        let response = rpc_client
-            .tx_search(packet_query(request, *seq), false, 1, 10, Order::Descending)
-            .await
-            .map_err(|e| Error::rpc(rpc_address.clone(), e))?;
+        // Query the latest 10 txs which include the event specified in the query request.
+        // Uses lenient_tx_search to tolerate events missing the `attributes` field.
+        let response =
+            lenient_tx_search(rpc_address, packet_query(request, *seq), 1, 10, Order::Descending)
+                .await?;
 
         if response.txs.is_empty() {
             continue;
@@ -199,10 +323,7 @@ pub async fn query_packets_from_block(
     let height = Height::new(chain_id.version(), u64::from(tm_height))
         .map_err(|_| Error::invalid_height_no_source())?;
 
-    let block_results = rpc_client
-        .block_results(tm_height)
-        .await
-        .map_err(|e| Error::rpc(rpc_address.clone(), e))?;
+    let block_results = lenient_block_results(rpc_address, tm_height).await?;
 
     let mut events: Vec<_> = block_results
         .begin_block_events
